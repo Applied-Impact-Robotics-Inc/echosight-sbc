@@ -160,6 +160,11 @@ func lowpassTaps(n int, fc float64) []float64 {
 type Baseband struct {
 	I []float64
 	Q []float64
+	// Mixer scratch, one trace long. Lives here rather than on Kernel
+	// because Kernel is shared read-only across workers while Baseband is
+	// per-Compressor.
+	mi []float64
+	mq []float64
 }
 
 // Demodulate runs stage 1 and stage 2 together in one pass.
@@ -196,26 +201,81 @@ func (k *Kernel) Demodulate(trace []int16, dst *Baseband) {
 	outN := (n + d - 1) / d
 	dst.I = grow(dst.I, outN)
 	dst.Q = grow(dst.Q, outN)
+	dst.mi = grow(dst.mi, n)
+	dst.mq = grow(dst.mq, n)
 
-	taps := k.taps
-	half := (len(taps) - 1) / 2
-	per := k.period
-
-	for o := 0; o < outN; o++ {
-		c := o * d // centre sample of this output
-		var accI, accQ float64
-		for t := 0; t < len(taps); t++ {
-			idx := c + t - half
-			if idx < 0 || idx >= n {
-				continue // zero-extend at the edges
-			}
-			v := float64(trace[idx])
-			m := idx % per
-			h := taps[t]
-			accI += v * k.cos[m] * h
-			accQ += v * -k.sin[m] * h
+	// PASS 1 - mix. Walk the mixer table with a rotating counter.
+	//
+	// The obvious formulation folds the mixer into the filter loop and
+	// indexes the table with idx%period. That costs one integer division per
+	// tap, which at 65 taps x 134 outputs x 32 channels x 32 shots is ~8.9
+	// million divisions per acquisition cycle — measured at 41 ms/cycle
+	// against a 14.4 ms budget on the PICO-RAP4. Mixing separately costs n
+	// extra multiplies per trace and removes every division.
+	mi, mq := dst.mi, dst.mq
+	cos, sin := k.cos, k.sin
+	m := 0
+	for i := 0; i < n; i++ {
+		v := float64(trace[i])
+		mi[i] = v * cos[m]
+		mq[i] = -v * sin[m]
+		m++
+		if m == k.period {
+			m = 0
 		}
-		// x2 restores the amplitude halved by real-signal mixing.
+	}
+
+	// PASS 2 - decimating FIR over the mixed signal.
+	//
+	// Split into edge and interior so the interior taps need no bounds
+	// check. The edges are the only places the filter window hangs off the
+	// trace, and they are a handful of outputs out of ~134.
+	taps := k.taps
+	nt := len(taps)
+	half := (nt - 1) / 2
+
+	lo := (half + d - 1) / d      // first output whose window fits
+	hi := (n - 1 - half) / d      // last output whose window fits
+	if hi >= outN {
+		hi = outN - 1
+	}
+	if lo > outN {
+		lo = outN
+	}
+
+	edge := func(o int) {
+		c := o*d - half
+		var accI, accQ float64
+		for t := 0; t < nt; t++ {
+			idx := c + t
+			if idx < 0 || idx >= n {
+				continue // zero-extend
+			}
+			h := taps[t]
+			accI += mi[idx] * h
+			accQ += mq[idx] * h
+		}
+		dst.I[o] = 2 * accI
+		dst.Q[o] = 2 * accQ
+	}
+	for o := 0; o < lo && o < outN; o++ {
+		edge(o)
+	}
+	for o := hi + 1; o < outN; o++ {
+		edge(o)
+	}
+
+	for o := lo; o <= hi; o++ {
+		base := o*d - half
+		si := mi[base : base+nt]
+		sq := mq[base : base+nt]
+		var accI, accQ float64
+		for t, h := range taps {
+			accI += si[t] * h
+			accQ += sq[t] * h
+		}
+		// x2 restores the amplitude halved by real-signal mixing. See the
+		// product-to-sum identity in the Demodulate doc comment.
 		dst.I[o] = 2 * accI
 		dst.Q[o] = 2 * accQ
 	}

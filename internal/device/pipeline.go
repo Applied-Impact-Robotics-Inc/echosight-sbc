@@ -2,6 +2,7 @@ package device
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,8 +50,7 @@ import (
 // pretending otherwise in code would be misleading.
 //
 // The DSP is ~4.3 GFLOP/s, about a quarter of one AVX2 core, so a single
-// worker is expected to be sufficient. numWorkers exists so that assumption
-// can be tested on real hardware rather than trusted.
+// worker was expected to be sufficient. It was not — see numWorkers below.
 // ============================================================================
 
 // pipeQueueFrames bounds the cycle queue between the read loop and the
@@ -59,9 +59,31 @@ import (
 // lower decimation, not a deeper queue.
 const pipeQueueFrames = 32
 
-// numWorkers is how many goroutines run the DSP chain. One is expected to
-// suffice; see the CORE AFFINITY note.
-const numWorkers = 1
+// numWorkers is how many goroutines run the DSP chain.
+//
+// One was the original guess, on the estimate that the chain costs ~4.3
+// GFLOP/s or about a quarter of an AVX2 core. Measurement on the PICO-RAP4
+// said otherwise: 41 ms per cycle against a 14.4 ms budget at 69.4 cycles/s.
+// Part of that was a division in the filter inner loop (since removed), and
+// part is simply that scalar Go on an E-core is not an AVX2 core.
+//
+// Cycles are independent — each carries its own geometry and encoder position
+// and is compressed in isolation — so this parallelises cleanly. Frames may
+// then complete out of order, which is fine: Header.Seq is assigned inside
+// the Compressor and the receiver sorts on it.
+//
+// Sized from the machine rather than hardcoded, leaving two cores for the
+// SI5G read loop and the network write, which must not be starved.
+var numWorkers = func() int {
+	n := runtime.NumCPU() - 2
+	if n < 1 {
+		n = 1
+	}
+	if n > 8 {
+		n = 8
+	}
+	return n
+}()
 
 type pipeState struct {
 	// running is driven by acquisition start/stop, exactly as imaging was.
@@ -72,6 +94,10 @@ type pipeState struct {
 	queue   chan pipeJob
 
 	send *uplink.Sender
+
+	// seq is the single frame sequence across all workers. Workers finish out
+	// of order; the sequence must not.
+	seq atomic.Uint64
 
 	// cfg is the compression configuration, swappable at the bench.
 	mu     sync.Mutex
@@ -123,6 +149,8 @@ func (s *Supervisor) pipeInit() {
 	if addr != "" {
 		go s.pipe.send.Run(ctx)
 	}
+	s.logf("info", "compression: %d workers (%d cpus, 2 reserved for io)",
+		numWorkers, runtime.NumCPU())
 	for i := 0; i < numWorkers; i++ {
 		s.pipe.wg.Add(1)
 		go s.pipeWorker(ctx, i)
@@ -247,12 +275,14 @@ func (s *Supervisor) pipeWorker(ctx context.Context, id int) {
 		s.logf("error", "compression worker %d: %v", id, err)
 		return
 	}
+	c.Shared = &s.pipe.seq
 
 	// int16 view of the cycle. The device delivers uint16 words; samples are
 	// signed. HF (raw RF) is mandatory here — see apply.go, which forces it —
 	// because demodulation on a rectified signal is meaningless.
 	var signed []int16
 	var lastStat time.Time
+	var lastFrames, lastIn, lastOut, lastNs uint64
 
 	for {
 		select {
@@ -274,10 +304,14 @@ func (s *Supervisor) pipeWorker(ctx context.Context, id int) {
 			}
 			s.pipe.send.Send(frame)
 
-			s.pipe.framesIn.Store(c.FramesIn)
-			s.pipe.bytesIn.Store(c.BytesIn)
-			s.pipe.bytesOut.Store(c.BytesOut)
-			s.pipe.compressNs.Store(c.CompressNs)
+			// Deltas, not absolutes: with several workers each holding its
+			// own Compressor, Store would make the totals whichever worker
+			// reported last instead of the sum.
+			s.pipe.framesIn.Add(c.FramesIn - lastFrames)
+			s.pipe.bytesIn.Add(c.BytesIn - lastIn)
+			s.pipe.bytesOut.Add(c.BytesOut - lastOut)
+			s.pipe.compressNs.Add(c.CompressNs - lastNs)
+			lastFrames, lastIn, lastOut, lastNs = c.FramesIn, c.BytesIn, c.BytesOut, c.CompressNs
 
 			if time.Since(lastStat) > time.Second {
 				lastStat = time.Now()
@@ -303,7 +337,10 @@ func (s *Supervisor) UplinkStats() wire.UplinkStats {
 	frames := s.pipe.framesIn.Load()
 	var ms float64
 	if frames > 0 {
-		ms = float64(s.pipe.compressNs.Load()) / float64(frames) / 1e6
+		// Per-cycle CPU time. Divide by numWorkers for the wall-clock rate,
+		// since workers run concurrently: 40 ms of CPU across 4 workers is
+		// 10 ms of wall clock per cycle.
+		ms = float64(s.pipe.compressNs.Load()) / float64(frames) / 1e6 / float64(numWorkers)
 	}
 	return wire.UplinkStats{
 		Connected:  st.Connected,

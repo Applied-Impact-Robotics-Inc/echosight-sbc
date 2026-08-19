@@ -106,6 +106,13 @@ type Stats struct {
 type Sender struct {
 	cfg Config
 
+	// discard is set when Addr is empty (bench mode). Frames are counted and
+	// thrown away at Send rather than queued, because with no Run goroutine
+	// there is nothing to drain the ring: it would fill in a few seconds and
+	// every subsequent frame would register as a drop. Bench mode must look
+	// healthy, since its whole purpose is timing the DSP without a far end.
+	discard bool
+
 	ring    chan []byte
 	pool    sync.Pool
 	closing atomic.Bool
@@ -132,9 +139,10 @@ func NewSender(cfg Config) *Sender {
 		cfg.Logf = func(string, string, ...any) {}
 	}
 	return &Sender{
-		cfg:    cfg,
-		ring:   make(chan []byte, cfg.RingFrames),
-		rateAt: time.Now(),
+		cfg:     cfg,
+		discard: cfg.Addr == "",
+		ring:    make(chan []byte, cfg.RingFrames),
+		rateAt:  time.Now(),
 	}
 }
 
@@ -158,6 +166,15 @@ func NewSender(cfg Config) *Sender {
 // RingFrames until the number goes away".
 func (s *Sender) Send(frame []byte) {
 	if s.closing.Load() {
+		return
+	}
+	if s.discard {
+		// Bench mode: account for the frame so throughput and ratio are still
+		// measured, then drop it on the floor. Not a drop in the error sense.
+		n := len(frame) + 4
+		s.framesSent.Add(1)
+		s.bytesSent.Add(uint64(n))
+		s.tickRate(uint64(n))
 		return
 	}
 	buf := s.get(len(frame))
@@ -282,7 +299,10 @@ func (s *Sender) Stats() Stats {
 	mbps, lastErr := s.rateMBps, s.lastErr
 	s.mu.Unlock()
 	return Stats{
-		Connected:  s.connected.Load(),
+		// Bench mode reports connected so the TUI and the endpoint do not
+		// show a fault that does not exist. Target is empty, which is how a
+		// reader tells the two apart.
+		Connected:  s.connected.Load() || s.discard,
 		Target:     s.cfg.Addr,
 		FramesSent: s.framesSent.Load(),
 		BytesSent:  s.bytesSent.Load(),

@@ -749,6 +749,11 @@ func detectHeaderGrid(a []uint16) (stride, phase int, ok bool) {
 	// start's offset inside the header (2 with encoders idle and uptime
 	// under ~71 min, 3 after, 12 with encoders active) is resolved by
 	// testing which one yields sane, consistent timers.
+	//
+	// The run is a fraction of the 32-word header, not the whole of it, and
+	// how large a fraction depends on the same uptime and encoder state that
+	// set the offset. Do not tighten the length window below to "about a
+	// header" — see the comment on it.
 	var starts []int
 	run := 0
 	for w := 0; w <= len(a); w++ {
@@ -757,7 +762,33 @@ func detectHeaderGrid(a []uint16) (stride, phase int, ok bool) {
 			run++
 			continue
 		}
-		if run >= 18 && run <= 40 {
+		// Lower bound is 12, not 18. The run length is NOT the header
+		// length: it is however much of the header happens to be zero,
+		// and that varies with uptime and encoder state. With timer words
+		// 2-3 still zero (uptime under ~71 min) and encoders idle, the run
+		// from offset 2 is only 15 words, because the two live timer words
+		// sit in front of it and the frame's first A-scan sample follows
+		// right after the reserved block.
+		//
+		// An 18 floor therefore rejects a perfectly valid header grid on a
+		// freshly booted machine, falls through to bare autocorrelation,
+		// and fails phase verification with nonsense timer intervals — the
+		// "header grid not found ... 1970372082860056 us header interval"
+		// signature. Nothing about the stream is wrong when that happens.
+		//
+		// Measured on serial 223, RBF 2.0.1, 16 MB capture (cmd/fmcdump):
+		// 328 zero-runs of exactly 15 words, 1.00 per frame, all at
+		// residue 2 mod 25632, timers 450/449/450 us apart against a
+		// 450 us sync period. The grid was always there.
+		//
+		// 12 rather than 15 leaves room for the encoders-active case,
+		// where the run from offset 2 collapses to 2 words and the usable
+		// run is the ~20-word reserved block starting at offset 12. The
+		// upper bound stays 40 to exclude quiet A-scan regions, and the
+		// timer-sanity loop below is what actually resolves the offset —
+		// this window only has to be wide enough not to discard the
+		// candidates before it gets to run.
+		if run >= 12 && run <= 40 {
 			starts = append(starts, w-run)
 		}
 		run = 0

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"math"
+	"sync/atomic"
 	"time"
 )
 
@@ -227,7 +228,12 @@ type Compressor struct {
 	hdr    []byte
 	out    []byte
 
-	seq uint64
+	// seq is local when Shared is nil. With more than one worker it MUST be
+	// shared, or every worker emits 1,2,3... and the receiver sees
+	// duplicates instead of a monotonic stream — which silently defeats gap
+	// detection, the only mechanism that reveals dropped frames.
+	seq    uint64
+	Shared *atomic.Uint64
 
 	// Stats, read by the pipeline for the TUI and the uplink endpoint.
 	FramesIn   uint64
@@ -303,11 +309,17 @@ func (c *Compressor) Frame(cycle []int16, g Geometry, m Motion) ([]byte, error) 
 		return nil, errf("stage 4: %w", err)
 	}
 
-	c.seq++
+	var seq uint64
+	if c.Shared != nil {
+		seq = c.Shared.Add(1)
+	} else {
+		c.seq++
+		seq = c.seq
+	}
 	h := Header{
 		Magic:      MagicV1,
 		Version:    FormatVersion,
-		Seq:        c.seq,
+		Seq:        seq,
 		TimerUs:    m.TimerUs,
 		WallNanos:  time.Now().UnixNano(),
 		Encoder:    m.Encoder,
