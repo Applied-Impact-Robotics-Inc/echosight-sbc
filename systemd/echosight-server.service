@@ -1,0 +1,20 @@
+[Unit]
+Description=Echosight acquisition server (Socomate SPIKE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ROOT_SPIKE=/opt/spike
+Environment=LD_LIBRARY_PATH=/opt/spike/Libraries
+ExecStart=/usr/local/bin/echosight-server --headless --log-file /var/log/echosight.log
+# Open() can wedge on a bad USB controller state and cannot be cancelled from
+# inside the process, so the server exits(1) and relies on this to come back.
+Restart=always
+RestartSec=2
+# Do not let systemd kill us mid-drain.
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
