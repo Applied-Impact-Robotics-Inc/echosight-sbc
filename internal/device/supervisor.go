@@ -61,10 +61,16 @@ type Supervisor struct {
 	mu      sync.RWMutex
 	staged  wire.Config
 	applied wire.Config
-	// hasConfig is false until a configuration arrives from the compute
-	// server. While false nothing is written to the board and acquisition is
-	// refused.
-	hasConfig bool
+	// hasApplied is false until a configuration has been APPLIED to the board.
+	//
+	// It deliberately does NOT track staging. Staging writes s.staged and
+	// leaves s.applied at its zero value, so a flag set by Stage made the
+	// reconnect path believe there was something to reapply and it reapplied
+	// the zero config: "fmc probe elements and aperture must be > 0", from a
+	// configuration nobody ever chose.
+	//
+	// While false nothing is reapplied and acquisition is refused.
+	hasApplied bool
 
 	acq       *acquisition
 	wasFiring bool
@@ -126,8 +132,10 @@ func New(opt Options) *Supervisor {
 	// be. So with no config the supervisor opens the device, reports what it
 	// found, and REFUSES TO ARM until one arrives.
 	var c wire.Config
-	hasConfig := opt.InitialConfig != nil
-	if hasConfig {
+	// An initial config has been PULLED but not yet applied. It seeds staged
+	// so the first apply has something to write, and leaves applied zero,
+	// which is the truth: nothing is on the board yet.
+	if opt.InitialConfig != nil {
 		c = *opt.InitialConfig
 	}
 	s := &Supervisor{
@@ -135,7 +143,6 @@ func New(opt Options) *Supervisor {
 		cmd:         make(chan func(), 16),
 		staged:      c,
 		applied:     c,
-		hasConfig:   hasConfig,
 		openBackoff: backoffMin,
 	}
 	s.opt.Store.Update(func(sn *state.Snapshot) { sn.Status.Simulated = opt.Simulated })
@@ -320,7 +327,7 @@ func (s *Supervisor) failOpen() {
 func (s *Supervisor) stepConfiguring() {
 	s.mu.RLock()
 	cfg := s.applied
-	have := s.hasConfig
+	have := s.hasApplied
 	s.mu.RUnlock()
 
 	// With no configuration there is nothing to write. The device stays open
@@ -560,7 +567,6 @@ func (s *Supervisor) Stage(c wire.Config) wire.ValidateResult {
 	if res.Valid {
 		s.mu.Lock()
 		s.staged = c
-		s.hasConfig = true
 		s.mu.Unlock()
 	}
 	return res

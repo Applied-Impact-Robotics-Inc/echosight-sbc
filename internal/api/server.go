@@ -25,6 +25,18 @@ type Server struct {
 	broker *state.Broker
 	onQuit func()
 
+	// stagedGen is the generation of the configuration most recently STAGED,
+	// carried on the X-Config-Generation header of PUT /api/config. It is
+	// promoted to configGen only by a successful apply.
+	//
+	// This machine deliberately does NOT compute the hash itself. It could —
+	// the config is the same document — but then two independently maintained
+	// Go structs would have to serialise byte-identically forever, and the
+	// first field reordering or nil-versus-empty-slice difference would show
+	// as a permanent mismatch and an endless push loop. Echoing back the value
+	// we were handed cannot drift.
+	stagedGen atomic.Value // string
+
 	// configGen is the generation hash of the configuration currently applied
 	// to the board, as handed down by the compute server.
 	//
@@ -38,6 +50,7 @@ type Server struct {
 func New(sup *device.Supervisor, store *state.Store, broker *state.Broker, onQuit func()) *Server {
 	s := &Server{sup: sup, store: store, broker: broker, onQuit: onQuit}
 	s.configGen.Store("")
+	s.stagedGen.Store("")
 	return s
 }
 
@@ -171,13 +184,24 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.sup.ConfigEnvelope())
 }
 
+// ConfigGenerationHeader carries the compute server's generation alongside a
+// staged configuration.
+const ConfigGenerationHeader = "X-Config-Generation"
+
 func (s *Server) putConfig(w http.ResponseWriter, r *http.Request) {
 	var c wire.Config
 	if err := readJSON(r, &c); err != nil {
 		fail(w, 400, err)
 		return
 	}
-	writeJSON(w, 200, s.sup.Stage(c))
+	res := s.sup.Stage(c)
+	if res.Valid {
+		// Remember what the caller called this configuration. Staging alone
+		// changes nothing on the board, so the generation stays pending until
+		// an apply succeeds.
+		s.stagedGen.Store(r.Header.Get(ConfigGenerationHeader))
+	}
+	writeJSON(w, 200, res)
 }
 
 func (s *Server) applyConfig(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +209,12 @@ func (s *Server) applyConfig(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		fail(w, 500, err)
 		return
+	}
+	// The staged generation is now on the board. Promoted only here, after a
+	// successful apply, so a stage that was never applied never claims to be
+	// running.
+	if g, _ := s.stagedGen.Load().(string); g != "" {
+		s.configGen.Store(g)
 	}
 	writeJSON(w, 200, res)
 }

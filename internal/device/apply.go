@@ -255,6 +255,7 @@ func (s *Supervisor) applyLocked(cfg wire.Config) (wire.ApplyResult, error) {
 
 	s.mu.Lock()
 	s.applied = cfg
+	s.hasApplied = true
 	s.staged = cfg
 	s.mu.Unlock()
 

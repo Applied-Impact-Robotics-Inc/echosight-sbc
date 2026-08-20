@@ -45,7 +45,7 @@ func (s *Supervisor) startAcqLocked(mode string, cycles int) error {
 		return fmt.Errorf("device is not open")
 	}
 	s.mu.RLock()
-	have := s.hasConfig
+	have := s.hasApplied
 	s.mu.RUnlock()
 	if !have {
 		// Firing an unconfigured board produces data against a geometry
