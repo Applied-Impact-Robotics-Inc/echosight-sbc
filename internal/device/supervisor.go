@@ -61,6 +61,10 @@ type Supervisor struct {
 	mu      sync.RWMutex
 	staged  wire.Config
 	applied wire.Config
+	// hasConfig is false until a configuration arrives from the compute
+	// server. While false nothing is written to the board and acquisition is
+	// refused.
+	hasConfig bool
 
 	acq       *acquisition
 	wasFiring bool
@@ -112,8 +116,18 @@ func New(opt Options) *Supervisor {
 	if opt.OpenTimeout == 0 {
 		opt.OpenTimeout = 20 * time.Second
 	}
-	c := config.Default()
-	if opt.InitialConfig != nil {
+	// NO FALLBACK to config.Default().
+	//
+	// Default() used to seed this, and that was correct when the machine
+	// persisted its own configuration. It is not now: a board that comes up
+	// running a configuration nobody selected is exactly the failure the pull
+	// design removes, and it is invisible — the board streams, the UI looks
+	// healthy, and the geometry is whatever the built-in default happened to
+	// be. So with no config the supervisor opens the device, reports what it
+	// found, and REFUSES TO ARM until one arrives.
+	var c wire.Config
+	hasConfig := opt.InitialConfig != nil
+	if hasConfig {
 		c = *opt.InitialConfig
 	}
 	s := &Supervisor{
@@ -121,6 +135,7 @@ func New(opt Options) *Supervisor {
 		cmd:         make(chan func(), 16),
 		staged:      c,
 		applied:     c,
+		hasConfig:   hasConfig,
 		openBackoff: backoffMin,
 	}
 	s.opt.Store.Update(func(sn *state.Snapshot) { sn.Status.Simulated = opt.Simulated })
@@ -305,7 +320,17 @@ func (s *Supervisor) failOpen() {
 func (s *Supervisor) stepConfiguring() {
 	s.mu.RLock()
 	cfg := s.applied
+	have := s.hasConfig
 	s.mu.RUnlock()
+
+	// With no configuration there is nothing to write. The device stays open
+	// and interrogable so the operator can see the serial, the firmware mode
+	// and any fault, which is most of what they need while they choose a tank.
+	if !have {
+		s.logf("warn", "device open but UNCONFIGURED: waiting for a configuration from the compute server")
+		s.opt.Store.SetPhase(state.PhaseRunning)
+		return
+	}
 
 	if _, err := s.applyLocked(cfg); err != nil {
 		s.setErr("reapply after reconnect failed: %v", err)
@@ -535,6 +560,7 @@ func (s *Supervisor) Stage(c wire.Config) wire.ValidateResult {
 	if res.Valid {
 		s.mu.Lock()
 		s.staged = c
+		s.hasConfig = true
 		s.mu.Unlock()
 	}
 	return res

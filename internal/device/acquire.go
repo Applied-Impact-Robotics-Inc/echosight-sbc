@@ -44,6 +44,15 @@ func (s *Supervisor) startAcqLocked(mode string, cycles int) error {
 	if !s.opt.Store.Snapshot().State.DeviceOpen {
 		return fmt.Errorf("device is not open")
 	}
+	s.mu.RLock()
+	have := s.hasConfig
+	s.mu.RUnlock()
+	if !have {
+		// Firing an unconfigured board produces data against a geometry
+		// nobody chose, and nothing downstream can tell that from real data.
+		return fmt.Errorf("no configuration: choose a tank on the compute server, " +
+			"then this machine will pull its configuration and arm")
+	}
 	if !s.firmwareOK() {
 		return fmt.Errorf(
 			"board booted in %s firmware; this server is FMC-only. Set Mode=FMC in config-devices.ini and power-cycle the board",

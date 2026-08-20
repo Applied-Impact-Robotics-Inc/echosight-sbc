@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -79,54 +80,31 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Pull the configuration for the ACTIVE SESSION from the compute server.
-	//
-	// This replaces last-config.json. That file existed to resume the
-	// operator's working point across a restart, which is the right goal, but
-	// it made this machine a second place a configuration could live and the
-	// two drifted: a stale file holding points 750 and rxCount 30 produced a
-	// diagonal crawl that looked like a live display for a whole session.
-	//
-	// Note this asks for the CURRENT SESSION, not for a default preset. A
-	// reboot mid-scan must restore the geometry the operator chose; pulling a
-	// default would silently revert step 1 to step 2 and everything downstream
-	// would look healthy while being reconstructed against the wrong aperture.
-	//
-	// With no compute server, or no active tank, initialCfg stays nil and the
-	// supervisor refuses to arm. There is deliberately no fallback: a default
-	// this machine could apply on its own is the second source of truth we are
-	// removing.
-	var (
-		initialCfg *wire.Config
-		initialGen string
-		cc         *compute.Client
-	)
+	log.Info("echosight-server starting",
+		"listen", *listen, "compute", *computeTo, "uplink", *uplinkTo,
+		"captures", *captureDir, "group", *group)
+
+	var cc *compute.Client
 	if *computeTo != "" {
 		cc = compute.New(*computeTo)
-		pullCtx, cancelPull := context.WithTimeout(ctx, 60*time.Second)
-		sess, err := cc.PullWithRetry(pullCtx, 5*time.Second, func(err error) {
-			if errors.Is(err, compute.ErrNoSession) {
-				log.Warn("no active tank on the compute server; waiting", "compute", *computeTo)
-			} else {
-				log.Warn("cannot reach the compute server; retrying", "compute", *computeTo, "err", err)
-			}
-		})
-		cancelPull()
-		if err != nil {
-			log.Error("no configuration pulled; the board will not arm until one arrives",
-				"compute", *computeTo, "err", err)
-		} else {
-			initialCfg = &sess.Config
-			initialGen = sess.Generation
-			log.Info("pulled configuration", "tank", sess.TankID, "generation", sess.Generation)
-		}
 	} else {
 		log.Error("no COMPUTE_ADDR set; this machine has no configuration source and will not arm")
 	}
 
 	// Declared ahead of the supervisor because OnApplied closes over them.
-	var srv *api.Server
-	appliedGen := initialGen
+	var (
+		srv        *api.Server
+		genMu      sync.Mutex
+		appliedGen string
+	)
+	setGen := func(g string) {
+		genMu.Lock()
+		appliedGen = g
+		genMu.Unlock()
+		if srv != nil {
+			srv.SetConfigGeneration(g)
+		}
+	}
 
 	sup := device.New(device.Options{
 		Store:            store,
@@ -137,14 +115,20 @@ func main() {
 		AutoResumeFiring: *autoResume,
 		CaptureDir:       *captureDir,
 		UplinkAddr:       *uplinkTo,
-		InitialConfig: initialCfg,
+		// Nil: nothing is configured at startup. The configuration arrives
+		// asynchronously below, so the board opens and reports its serial and
+		// firmware while the operator is still choosing a tank.
+		InitialConfig: nil,
 		// Nothing is written to disk. The generation is recorded in memory and
 		// reported in GET /api/state, which is how the compute server notices
 		// this process restarted and pushes again. An applied config that this
 		// machine cannot name is one the compute server cannot verify.
 		OnApplied: func(c wire.Config) {
+			genMu.Lock()
+			g := appliedGen
+			genMu.Unlock()
 			if srv != nil {
-				srv.SetConfigGeneration(appliedGen)
+				srv.SetConfigGeneration(g)
 			}
 		},
 		OnHang: func() {
@@ -162,7 +146,53 @@ func main() {
 	go sup.Run(ctx)
 
 	srv = api.New(sup, store, broker, stop)
-	srv.SetConfigGeneration(appliedGen)
+
+	// Pull the configuration for the ACTIVE SESSION, in the background.
+	//
+	// Blocking on this delayed opening the board by however long it took a
+	// human to choose a tank, and the two are independent: detection, open and
+	// interrogation need no configuration at all. Only arming does.
+	//
+	// It asks for the CURRENT SESSION, not a default preset. A reboot mid-scan
+	// must restore the geometry the operator chose; pulling a default would
+	// silently revert step 1 to step 2 and everything downstream would look
+	// healthy while being reconstructed against the wrong aperture.
+	//
+	// The retry never gives up. Boot order between the robot and the compute
+	// server is not guaranteed, and a tank chosen ten minutes from now should
+	// bring the board to life without anyone restarting this process.
+	if cc != nil {
+		go func() {
+			sess, err := cc.PullWithRetry(ctx, 5*time.Second, func(err error) {
+				if errors.Is(err, compute.ErrNoSession) {
+					log.Warn("no active tank on the compute server; waiting", "compute", *computeTo)
+				} else {
+					log.Warn("cannot reach the compute server; retrying", "compute", *computeTo, "err", err)
+				}
+			})
+			if err != nil {
+				return // context cancelled: shutting down
+			}
+			log.Info("pulled configuration", "tank", sess.TankID, "generation", sess.Generation)
+
+			if res := sup.Stage(sess.Config); !res.Valid {
+				log.Error("configuration from the compute server is invalid", "errors", res.Errors)
+				return
+			}
+			// The generation is recorded BEFORE the apply, because OnApplied
+			// fires from inside it. It is the value the compute server issued,
+			// never one recomputed here: a serialisation difference between
+			// the two would show as a permanent mismatch and an endless push.
+			setGen(sess.Generation)
+
+			if _, err := sup.Apply(ctx); err != nil {
+				log.Error("applying pulled configuration", "err", err)
+				setGen("")
+				return
+			}
+			log.Info("configured from the compute server", "tank", sess.TankID, "generation", sess.Generation)
+		}()
+	}
 	httpSrv := &http.Server{
 		Addr:              *listen,
 		Handler:           srv.Handler(),
