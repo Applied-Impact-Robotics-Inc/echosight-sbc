@@ -26,24 +26,34 @@ Added in their place:
 | `internal/device/pipeline.go` | worker at the seam `imaging.go` used to occupy |
 | `GET /api/uplink` | compression and transmit health |
 
+Since removed as well: the TUI, presets (global, on the compute server now),
+pose (the compute server owns the arm and therefore the pose), and config
+persistence (Mongo on the compute server is the only place a configuration
+lives; this machine holds one in RAM and writes none).
+
 Everything else is untouched: the SI5G cgo bindings, the FMC read loop and its
-hard-won transfer semantics, configuration and apply, capture-to-file, presets,
-pose, and the TUI.
+hard-won transfer semantics, apply, and capture-to-file.
 
 ## Running
 
 ```
-echosight-sbc --uplink 10.0.0.20:9200 --headless
-echosight-sbc                       # bench mode: compress, time it, discard
+echosight-server                    # settings come from .env
 ```
 
-`--uplink` empty is a deliberate bench mode. The full chain runs and reports
-throughput, but frames are discarded, so you can exercise and time the DSP
-without the compute server existing.
+Configuration comes from the environment; see `.env.example`. `COMPUTE_ADDR`
+is the compute server's HTTP API, which this machine pulls its board
+configuration from on boot and on reconnect, and `UPLINK_ADDR` is where
+compressed frames go. An empty `UPLINK_ADDR` is a deliberate bench mode: the
+full chain runs and reports throughput while frames are discarded, so the DSP
+can be exercised and timed without the compute server existing.
 
-Other flags are unchanged: `--listen`, `--presets`, `--captures`, `--group`,
-`--serial`, `--pose`, `--open-timeout`, `--auto-resume`, `--log-file`,
-`--exit-on-hang`.
+There is no TUI and no `--headless`. This runs under systemd on a machine
+inside a tank; the operator interface is Tank Sight, talking to the compute
+server. Logs go to stderr, and to `--log-file` if given.
+
+Remaining flags: `--listen`, `--captures`, `--compute`, `--uplink`, `--group`,
+`--serial`, `--open-timeout`, `--auto-resume`, `--log-file`, `--exit-on-hang`.
+The first four take their defaults from the environment.
 
 ## Compression
 
@@ -91,9 +101,12 @@ There is no sampling code to choose. `DefaultParams` reflects this.
 - **Not measured:** zstd-1 or LZ4 throughput, anywhere.
 - **Not measured:** anything at all on the actual PICO-RAP4.
 
-The bring-up default is therefore `CodecNone`, which yields 2.67× from stages
-1–3 alone — about 46 MB/s, comfortably inside the link budget — and removes the
-unbenchmarked variable from board bring-up. Swap it once a codec has been
+The bring-up default is therefore `CodecNone` at D=6, which yields **3.98×**
+from stages 1–3 alone — about 29 MB/s against ~114 MB/s of ingest, comfortably
+inside the link budget — and removes the unbenchmarked variable from board
+bring-up. (The 2.67× in the table above is the D=4 packed-only figure; do not
+expect it at the default decimation. Cross-check: 3.98 × 1.37 entropy = 5.44×,
+the measured D=6 row.) Swap it once a codec has been
 measured on this hardware at 12 W with the DSP on the E-cores. The decision
 procedure is written out in `internal/compress/entropy.go`.
 

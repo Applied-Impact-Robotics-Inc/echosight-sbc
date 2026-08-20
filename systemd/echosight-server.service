@@ -12,7 +12,7 @@ Environment=LD_LIBRARY_PATH=/opt/spike/Libraries
 # rather than a unit that refuses to start with nothing in the log.
 EnvironmentFile=-/etc/echosight/echosight.env
 WorkingDirectory=/etc/echosight
-ExecStart=/usr/local/bin/echosight-server --headless --log-file /var/log/echosight.log
+ExecStart=/usr/local/bin/echosight-server --log-file /var/log/echosight.log
 # Open() can wedge on a bad USB controller state and cannot be cancelled from
 # inside the process, so the server exits(1) and relies on this to come back.
 Restart=always

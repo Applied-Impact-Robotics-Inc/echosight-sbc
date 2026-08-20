@@ -66,7 +66,7 @@ type Store struct {
 }
 
 // SetMirror registers a sink that receives every log line in addition to the
-// ring. Used in --headless mode to copy supervisor errors to stderr, which
+// ring. Copies supervisor errors to stderr, which
 // otherwise only ever reach the TUI's log panel and are invisible under
 // systemd. The sink must not call Logf (deadlock).
 func (s *Store) SetMirror(fn func(level, msg string)) {

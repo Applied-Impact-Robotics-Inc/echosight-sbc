@@ -8,7 +8,7 @@
 // diagnostics. It is not the data path.
 //
 //	echosight-server --listen 0.0.0.0:8975
-//	echosight-server --headless --log-file /var/log/echosight.log
+//	echosight-server --log-file /var/log/echosight.log
 //
 // Binding to 0.0.0.0 is the default because the client is never on this
 // machine. Binding to loopback would make the app unreachable, which is the
@@ -34,7 +34,6 @@ import (
 	"echosight/internal/compute"
 	"echosight/internal/device"
 	"echosight/internal/state"
-	"echosight/internal/tui"
 	"echosight/internal/wire"
 )
 
@@ -65,7 +64,6 @@ func main() {
 		serial     = flag.Int("serial", 0, "expected board serial; 0 accepts any detected board")
 		openTO     = flag.Duration("open-timeout", 20*time.Second, "deadline on the SI5G Open() call")
 		autoResume = flag.Bool("auto-resume", true, "restart firing automatically after a reconnect")
-		headless   = flag.Bool("headless", false, "no TUI; log to stderr (use under systemd)")
 		uplinkTo   = flag.String("uplink", env("UPLINK_ADDR", ""), "compute server frame receiver, host:port (UPLINK_ADDR). Empty runs compression and discards output (bench mode)")
 		logFile    = flag.String("log-file", "", "also append logs to this file")
 		exitOnHang = flag.Bool("exit-on-hang", true, "exit(1) when Open() blows its deadline so a supervisor can restart us")
@@ -75,7 +73,7 @@ func main() {
 	store := state.NewStore()
 	broker := state.NewBroker()
 
-	log, closeLog := newLogger(store, *headless, *logFile)
+	log, closeLog := newLogger(store, *logFile)
 	defer closeLog()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -183,26 +181,12 @@ func main() {
 		}
 	}()
 
-	if !*headless {
-		bg := context.Background()
-		m := tui.New(store, sup, *listen, tui.Actions{
-			Reconnect: func() { _ = sup.Reconnect(bg) },
-			Start:     func() { _ = sup.StartAcq(bg, "continuous", 0) },
-			Stop:      func() { _ = sup.StopAcq(bg) },
-		})
-		if err := tui.Run(ctx, m); err != nil && !errors.Is(err, context.Canceled) {
-			fmt.Fprintln(os.Stderr, "tui:", err)
-		}
-		// Cancel the app context only AFTER Bubble Tea has returned; the
-		// program was created with tea.WithContext(ctx) and cancelling it
-		// while the event loop is mid-Update deadlocks it (see tui.go).
-		// This also stops the supervisor's step loop before the teardown
-		// below closes the device, so the state machine cannot race a
-		// re-open against process exit.
-		stop()
-	} else {
-		<-ctx.Done()
-	}
+	// Wait for a signal. There is no TUI: this process runs under systemd on a
+	// machine inside a tank, and the operator interface is Tank Sight talking
+	// to the compute server. A terminal UI on the robot was something only a
+	// person standing next to the robot could read, and by the time the robot
+	// is somewhere it matters, nobody is.
+	<-ctx.Done()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -261,74 +245,32 @@ func (h storeHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.inner.Handle(ctx, r)
 }
 
-func newLogger(store *state.Store, headless bool, path string) (*slog.Logger, func()) {
+func newLogger(store *state.Store, path string) (*slog.Logger, func()) {
 	var inner slog.Handler
 	closer := func() {}
 
-	// Bubble Tea owns the terminal. Writing to stderr underneath it corrupts
-	// the frame, so in TUI mode the only sinks are the ring and the log file.
+	// Mirror the ENTIRE log ring to stderr rather than attaching a stderr
+	// handler to slog.
 	//
-	// In headless mode, mirror the ENTIRE log ring to stderr rather than
-	// attaching a stderr handler to slog. The supervisor logs through
-	// store.Logf directly (not slog), so a slog-only stderr sink silently
-	// swallows every connection error — "could not load libsi5g.so",
-	// "number_of_devices: ...", Open() failures — which is exactly what an
-	// operator under systemd needs to see. Every line already lands in the
-	// ring (slog lines via storeHandler, supervisor lines directly), so the
-	// mirror is the single stderr path and nothing prints twice.
-	if headless {
-		store.SetMirror(func(level, msg string) {
-			fmt.Fprintf(os.Stderr, "%s %-5s %s\n",
-				time.Now().Format("15:04:05.000"), level, msg)
-		})
-	}
+	// The supervisor logs through store.Logf directly, not slog, so a
+	// slog-only stderr sink silently swallows every connection error:
+	// "could not load libsi5g.so", "number_of_devices: ...", Open() failures.
+	// Those are exactly what an operator under systemd needs to see. Every
+	// line already lands in the ring, slog lines via storeHandler and
+	// supervisor lines directly, so the mirror is the single stderr path and
+	// nothing prints twice.
+	store.SetMirror(func(level, msg string) {
+		fmt.Fprintf(os.Stderr, "%s %-5s %s\n",
+			time.Now().Format("15:04:05.000"), level, msg)
+	})
+
 	if path != "" {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err == nil {
-			fh := slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
-			if inner == nil {
-				inner = fh
-			} else {
-				inner = multiHandler{inner, fh}
-			}
+			inner = slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
 			closer = func() { _ = f.Close() }
 		}
 	}
 	return slog.New(storeHandler{inner: inner, store: store}), closer
 }
 
-type multiHandler []slog.Handler
-
-func (m multiHandler) Enabled(ctx context.Context, l slog.Level) bool {
-	for _, h := range m {
-		if h.Enabled(ctx, l) {
-			return true
-		}
-	}
-	return false
-}
-
-func (m multiHandler) Handle(ctx context.Context, r slog.Record) error {
-	for _, h := range m {
-		if h.Enabled(ctx, r.Level) {
-			_ = h.Handle(ctx, r.Clone())
-		}
-	}
-	return nil
-}
-
-func (m multiHandler) WithAttrs(as []slog.Attr) slog.Handler {
-	out := make(multiHandler, len(m))
-	for i, h := range m {
-		out[i] = h.WithAttrs(as)
-	}
-	return out
-}
-
-func (m multiHandler) WithGroup(name string) slog.Handler {
-	out := make(multiHandler, len(m))
-	for i, h := range m {
-		out[i] = h.WithGroup(name)
-	}
-	return out
-}
