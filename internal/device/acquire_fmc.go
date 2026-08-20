@@ -544,16 +544,6 @@ func (s *Supervisor) readLoopFMC(ctx context.Context, a *acquisition, cfg wire.C
 				}
 			}
 
-			if s.opt.Pose != nil {
-				p, age, ok := s.opt.Pose.At(meta.HostTimeUs)
-				meta.Pose = p
-				meta.Pose.Valid = ok
-				s.opt.Store.Update(func(sn *state.Snapshot) {
-					sn.PoseValid = ok
-					sn.PoseAgeMs = age
-				})
-			}
-
 			s.bundleSeq++
 			meta.BundleSeq = s.bundleSeq
 			encBufs[encIdx] = wire.EncodeBundle(encBufs[encIdx], meta, recs)

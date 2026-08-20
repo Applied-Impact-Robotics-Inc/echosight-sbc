@@ -1,13 +1,13 @@
-// Package config owns the config value type's defaults, validation, the SI5G
-// apply plan, and persistence. FMC-only: there are no scan kinds, no gates, no
-// DAC, and no backwards compatibility with the phased-array era.
+// Package config owns the config value type's defaults, validation and the
+// SI5G apply plan. It no longer owns persistence: configurations live on the
+// compute server and this machine holds one in RAM. FMC-only: there are no
+// scan kinds, no gates, no DAC, and no backwards compatibility with the
+// phased-array era.
 package config
 
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"echosight/internal/wire"
 	"echosight/spike"
@@ -174,7 +174,7 @@ func Validate(c wire.Config) wire.ValidateResult {
 // usbCeilingMBs is the measured sustained ceiling on the SBC's USB3 link, well
 // below Socomate's 316 MB/s benchmark figure. Bench-tunable; keep it
 // pessimistic, because exceeding it fails silently.
-const usbCeilingMBs = 186
+const usbCeilingMBs float64 = 186
 
 // FrameBytes is the wire size of one FMC frame: a 32-word header followed by
 // rxCount*points interleaved int16 samples.
@@ -298,60 +298,15 @@ func ValidateScriptJSON(s string) wire.ValidateResult {
 // Persistence
 // ---------------------------------------------------------------------------
 
-// ErrWrongVersion is returned by Load for any file that is not ConfigVersion.
-// There is deliberately no migration path: every pre-v2 file is a
-// phased-array config describing a scan this server can no longer run, and
-// falling back to Default() lands the operator on a working FMC setup instead
-// of a half-translated one.
-type ErrWrongVersion struct {
-	Path string
-	Got  int
-}
-
-func (e *ErrWrongVersion) Error() string {
-	return fmt.Sprintf("%s is config v%d; this server only reads v%d (pre-FMC configs are not migrated)",
-		e.Path, e.Got, wire.ConfigVersion)
-}
-
-// Load reads a config file. On a version mismatch the file is renamed aside
-// with a .v1.bak suffix so nothing is silently destroyed, and ErrWrongVersion
-// is returned; callers fall back to Default().
-func Load(path string) (wire.Config, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return wire.Config{}, err
-	}
-	var probe struct {
-		V int `json:"v"`
-	}
-	if err := json.Unmarshal(b, &probe); err != nil {
-		return wire.Config{}, fmt.Errorf("%s: %w", path, err)
-	}
-	if probe.V != wire.ConfigVersion {
-		bak := path + ".v1.bak"
-		_ = os.Rename(path, bak)
-		return wire.Config{}, &ErrWrongVersion{Path: path, Got: probe.V}
-	}
-	var c wire.Config
-	if err := json.Unmarshal(b, &c); err != nil {
-		return wire.Config{}, fmt.Errorf("%s: %w", path, err)
-	}
-	return c, nil
-}
-
-// Save writes a config atomically (temp file + rename), stamping the version.
-func Save(path string, c wire.Config) error {
-	c.V = wire.ConfigVersion
-	b, err := json.MarshalIndent(c, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
+// Load, Save and ErrWrongVersion are GONE.
+//
+// This machine no longer persists a configuration. It pulls one for the active
+// session from the compute server on boot and on reconnect, holds it in RAM for
+// the life of the process, and writes nothing. A file here was a second place a
+// configuration could live, and the two drifted: a stale last-config.json
+// holding points 750 and rxCount 30 produced a diagonal crawl that looked like
+// a live display for a whole session before anyone distrusted it.
+//
+// Default() survives, but NOT as something this machine applies on its own. It
+// is the seed the compute server uses when creating a new tank, and it is
+// reachable here only so the two stay in step.

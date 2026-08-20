@@ -4,6 +4,7 @@ package api
 
 import (
 	"strings"
+	"sync/atomic"
 	"os"
 	"encoding/base64"
 	"bytes"
@@ -14,22 +15,40 @@ import (
 	"time"
 
 	"echosight/internal/device"
-	"echosight/internal/presets"
 	"echosight/internal/state"
 	"echosight/internal/wire"
 )
 
 type Server struct {
-	sup     *device.Supervisor
-	store   *state.Store
-	broker  *state.Broker
-	presets *presets.Store
-	onQuit  func()
+	sup    *device.Supervisor
+	store  *state.Store
+	broker *state.Broker
+	onQuit func()
 
+	// configGen is the generation hash of the configuration currently applied
+	// to the board, as handed down by the compute server.
+	//
+	// It is EMPTY until something is applied, and that empty value is load
+	// bearing: it is what a freshly restarted SBC reports, and it is how the
+	// compute server notices it needs to push again. Without it a rebooted
+	// board sits unarmed while every readout upstream looks healthy.
+	configGen atomic.Value // string
 }
 
-func New(sup *device.Supervisor, store *state.Store, broker *state.Broker, ps *presets.Store, onQuit func()) *Server {
-	return &Server{sup: sup, store: store, broker: broker, presets: ps, onQuit: onQuit}
+func New(sup *device.Supervisor, store *state.Store, broker *state.Broker, onQuit func()) *Server {
+	s := &Server{sup: sup, store: store, broker: broker, onQuit: onQuit}
+	s.configGen.Store("")
+	return s
+}
+
+// SetConfigGeneration records what the board is now running. Called from the
+// supervisor's OnApplied hook.
+func (s *Server) SetConfigGeneration(gen string) { s.configGen.Store(gen) }
+
+// ConfigGeneration is what the compute server compares against.
+func (s *Server) ConfigGeneration() string {
+	v, _ := s.configGen.Load().(string)
+	return v
 }
 
 func statusEnvelope(s wire.AppStatus) wire.StatusMsg {
@@ -64,10 +83,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/expert", s.expert)
 	mux.HandleFunc("POST /api/calibrate/velocity", s.calibrate)
 
-	mux.HandleFunc("GET /api/presets", s.listPresets)
-	mux.HandleFunc("GET /api/presets/{name}", s.getPreset)
-	mux.HandleFunc("PUT /api/presets/{name}", s.savePreset)
-	mux.HandleFunc("DELETE /api/presets/{name}", s.deletePreset)
 
 	mux.HandleFunc("/ws", s.handleWS)
 
@@ -122,8 +137,14 @@ func readJSON(r *http.Request, v any) error {
 // device / state
 // ---------------------------------------------------------------------------
 
+// getState carries the applied config generation alongside the device state,
+// so the compute server answers "is it alive" and "is it running what I think"
+// in one call rather than racing two.
 func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, s.sup.State())
+	writeJSON(w, 200, struct {
+		wire.AppState
+		ConfigGen string `json:"configGen"`
+	}{s.sup.State(), s.ConfigGeneration()})
 }
 
 func (s *Server) getDevice(w http.ResponseWriter, r *http.Request) {
@@ -383,45 +404,3 @@ func (s *Server) calibrate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]float64{"velocityMps": v})
 }
 
-// ---------------------------------------------------------------------------
-// presets
-// ---------------------------------------------------------------------------
-
-func (s *Server) listPresets(w http.ResponseWriter, r *http.Request) {
-	list, err := s.presets.List()
-	if err != nil {
-		fail(w, 500, err)
-		return
-	}
-	writeJSON(w, 200, list)
-}
-
-func (s *Server) getPreset(w http.ResponseWriter, r *http.Request) {
-	c, err := s.presets.Get(r.PathValue("name"))
-	if err != nil {
-		fail(w, 404, err)
-		return
-	}
-	writeJSON(w, 200, c)
-}
-
-func (s *Server) savePreset(w http.ResponseWriter, r *http.Request) {
-	var c wire.Config
-	if err := readJSON(r, &c); err != nil {
-		fail(w, 400, err)
-		return
-	}
-	if err := s.presets.Save(r.PathValue("name"), c); err != nil {
-		fail(w, 500, err)
-		return
-	}
-	writeJSON(w, 204, nil)
-}
-
-func (s *Server) deletePreset(w http.ResponseWriter, r *http.Request) {
-	if err := s.presets.Delete(r.PathValue("name")); err != nil {
-		fail(w, 404, err)
-		return
-	}
-	writeJSON(w, 204, nil)
-}

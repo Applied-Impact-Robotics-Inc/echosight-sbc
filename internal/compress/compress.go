@@ -28,7 +28,19 @@ const MagicV1 uint32 = 0x45534831 // "ESH1"
 
 // FormatVersion increments on any layout change. The receiver must reject
 // frames it does not recognise rather than guessing.
-const FormatVersion uint16 = 1
+//
+// v2: the payload now begins with a per-trace scale table.
+//
+// v1 stored ONE QScale in the header while quantising each trace against its
+// own peak. Every trace therefore decoded to full scale and the true
+// amplitude of all but the last was unrecoverable. Harmless for looking at a
+// single A-scan's shape; fatal for TFM, where delay-and-sum combines channels
+// coherently and the relative amplitude BETWEEN channels is the image. A
+// strong near-tx channel and a weak far one decoded identically.
+//
+// Found by decoding a real capture: all 1024 traces came back at exactly
+// ±2047.
+const FormatVersion uint16 = 2
 
 // HeaderBytes is the fixed-size header preceding the payload.
 const HeaderBytes = 96
@@ -77,7 +89,10 @@ type Header struct {
 	_          uint8
 	CarrierHz  uint32
 	CutoffHz   uint32
-	QScale     float64 // multiply codes by this to recover baseband amplitude
+	// QScale is the LARGEST per-trace scale in the frame, kept for quick
+	// "how hot was this frame" checks and for logs. It is NOT sufficient to
+	// reconstruct: use the per-trace table at the head of the payload.
+	QScale     float64
 
 	// --- integrity ---
 	RawBytes   uint32 // payload size before stage 4
@@ -209,6 +224,21 @@ type Motion struct {
 	Encoder [4]int32
 }
 
+// TraceScales is the per-trace scale table that prefixes every v2 payload:
+// float32, little-endian, one per trace, in the same [shot][channel] order as
+// the packed codes that follow.
+//
+// float32 rather than float64 because the scales span a handful of orders of
+// magnitude and 24 bits of mantissa is far more than the 12-bit codes can
+// use. 1024 traces costs 4 KB against a ~412 KB payload — under 1%, to
+// recover information that cannot be reconstructed any other way.
+//
+// Per-trace scaling is kept rather than switching to one scale per frame,
+// because FMC channel amplitudes span a wide range within a single shot and
+// a single frame-wide scale would leave the weakest channels with only a few
+// usable bits. Store the scales; do not throw away the headroom.
+const TraceScaleBytes = 4
+
 // Compressor runs the full chain for one worker. It is NOT safe for
 // concurrent use: each worker holds its own, so the scratch buffers below can
 // be reused without allocation. Sustained 122 MB/s through a garbage-
@@ -219,11 +249,12 @@ type Compressor struct {
 	codec Codec
 	id    uint8
 
-	bb     Baseband
-	q      Quantised
-	trace  []int16
+	bb      Baseband
+	q       Quantised
+	trace   []int16
 	scratch []byte
-	packed []byte
+	scales  []float32
+	packed  []byte
 	wire   []byte
 	hdr    []byte
 	out    []byte
@@ -282,6 +313,11 @@ func (c *Compressor) Frame(cycle []int16, g Geometry, m Motion) ([]byte, error) 
 
 	c.packed = c.packed[:0]
 	c.trace = growI16(c.trace, pts)
+	nTraces := shots * ch
+	if cap(c.scales) < nTraces {
+		c.scales = make([]float32, nTraces)
+	}
+	c.scales = c.scales[:0]
 
 	// De-interleave to channel-major before the DSP runs. Filtering in place
 	// on the interleaved layout would stride the cache by channels*2 bytes on
@@ -296,10 +332,25 @@ func (c *Compressor) Frame(cycle []int16, g Geometry, m Motion) ([]byte, error) 
 			}
 			c.k.Demodulate(c.trace, &c.bb)
 			c.k.Quantise(&c.bb, &c.q)
+			// Record THIS trace's scale. Without it the trace decodes to
+			// full scale and its true amplitude is gone.
+			c.scales = append(c.scales, float32(c.q.Scale))
 			c.scratch = PackBits(&c.q, c.scratch)
 			c.packed = append(c.packed, c.scratch...)
 		}
 	}
+
+	// Prefix the scale table. Done here rather than in PackBits so the
+	// packing stays a pure function of one trace.
+	tbl := make([]byte, len(c.scales)*TraceScaleBytes)
+	var maxScale float64
+	for i, sc := range c.scales {
+		binary.LittleEndian.PutUint32(tbl[i*4:], math.Float32bits(sc))
+		if float64(sc) > maxScale {
+			maxScale = float64(sc)
+		}
+	}
+	c.packed = append(tbl, c.packed...)
 
 	rawBytes := len(c.packed)
 	c.wire = c.wire[:0]
@@ -333,7 +384,7 @@ func (c *Compressor) Frame(cycle []int16, g Geometry, m Motion) ([]byte, error) 
 		CodecID:    c.id,
 		CarrierHz:  uint32(c.k.P.CarrierMHz * 1e6),
 		CutoffHz:   uint32(c.k.P.CutoffMHz * 1e6),
-		QScale:     c.q.Scale,
+		QScale:     maxScale,
 		RawBytes:   uint32(rawBytes),
 		WireBytes:  uint32(len(c.wire)),
 		PayloadCRC: crc32.Checksum(c.wire, castagnoli),

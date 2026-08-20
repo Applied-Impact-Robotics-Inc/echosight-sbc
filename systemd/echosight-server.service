@@ -7,6 +7,11 @@ Wants=network-online.target
 Type=simple
 Environment=ROOT_SPIKE=/opt/spike
 Environment=LD_LIBRARY_PATH=/opt/spike/Libraries
+# Machine-specific settings, chiefly COMPUTE_ADDR and UPLINK_ADDR. Marked
+# optional so a missing file is a config error the server reports itself
+# rather than a unit that refuses to start with nothing in the log.
+EnvironmentFile=-/etc/echosight/echosight.env
+WorkingDirectory=/etc/echosight
 ExecStart=/usr/local/bin/echosight-server --headless --log-file /var/log/echosight.log
 # Open() can wedge on a bad USB controller state and cannot be cancelled from
 # inside the process, so the server exits(1) and relies on this to come back.

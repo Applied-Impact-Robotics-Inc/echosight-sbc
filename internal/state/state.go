@@ -51,11 +51,8 @@ type Snapshot struct {
 	UplinkDropped   uint64
 	FramesSent      uint64
 
-	Clients      int
-	ClientDrops  uint64
-	PoseSource   string
-	PoseValid    bool
-	PoseAgeMs    int64
+	Clients     int
+	ClientDrops uint64
 }
 
 type Store struct {

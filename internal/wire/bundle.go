@@ -2,24 +2,19 @@ package wire
 
 import (
 	"encoding/binary"
-	"math"
 )
 
 /*
 Binary A-scan bundle, little-endian. One bundle per firing cycle (sweep).
 
-Header, 64 bytes:
+Header, 32 bytes:
 
-	u8   msgType      0x01 A-scan, 0x02 reserved for FMC
+	u8   msgType      0x03 A-scan
 	u8   group
 	u16  count        number of A-scan records
 	u32  bundleSeq    monotonic per WS connection; gaps mean the backend dropped
 	u64  hostTimeUs   backend wall clock at the first firing of the sweep
 	i32  encoders[4]  from the SI5G frame header of the first firing
-	f32  posMm[3]     robot pose interpolated to the sweep, millimetres
-	f32  quat[4]      orientation, w x y z
-	u8   poseValid    0 when no pose source is configured or the sample is stale
-	u8   pad[3]
 
 Record header, 16 bytes, then nPoints i16 samples:
 
@@ -32,19 +27,41 @@ Record header, 16 bytes, then nPoints i16 samples:
 
 Every offset stays 2-byte aligned so the browser can take a zero-copy
 Int16Array view over the sample block.
+
+---------------------------------------------------------------------------
+POSE IS GONE, AND THE MESSAGE TYPE MOVED BECAUSE OF IT
+---------------------------------------------------------------------------
+
+The header used to be 64 bytes and carried an interpolated robot pose: 12
+bytes of position, 16 of orientation, a validity byte and 3 of padding. It was
+left over from when this machine did reconstruction and needed to place an
+image.
+
+It does not any more. Reconstruction moved to the compute server, which owns
+the arm and therefore owns the pose, and stamping it here would have meant a
+second pose path measured against a second clock — a discrepancy that would
+surface eventually as a placement error nobody could source.
+
+msgType moved 0x01 -> 0x03 in the same change. That is the whole point of
+touching it: a decoder written for the 64-byte layout reading a 32-byte one
+does not fail, it silently reads the first record's header as pose and every
+sample offset is then 32 bytes wrong. Producing garbage that parses is the
+failure mode this system keeps having to design against, so the type byte
+makes a stale consumer stop instead.
+
+0x01 is the retired 64-byte pose-bearing layout and must never be reused.
+0x02 stays reserved for FMC.
 */
 const (
-	BundleHeaderBytes = 64
+	BundleHeaderBytes = 32
 	RecordHeaderBytes = 16
-	MsgTypeAscan      = 0x01
-)
 
-// Pose is a robot pose sample interpolated to a sweep timestamp.
-type Pose struct {
-	PosMm [3]float32
-	Quat  [4]float32 // w x y z
-	Valid bool
-}
+	// MsgTypeAscan is the current layout.
+	MsgTypeAscan = 0x03
+	// MsgTypeAscanLegacyPose is the retired 64-byte header. Declared so the
+	// value stays claimed and a reader can name what it is refusing.
+	MsgTypeAscanLegacyPose = 0x01
+)
 
 // AscanRecord references sample data owned by the caller. Encode copies it.
 type AscanRecord struct {
@@ -62,8 +79,11 @@ type BundleMeta struct {
 	Group      uint8
 	BundleSeq  uint32
 	HostTimeUs uint64
-	Encoders   [4]int32
-	Pose       Pose
+	// Encoders are RAW DEVICE COUNTS, as read from the frame header. Nothing
+	// converts them here: turning counts into arm arc position is a
+	// calibration, and a calibration change must never require reflashing a
+	// robot that is inside a tank.
+	Encoders [4]int32
 }
 
 // BundleSize reports the exact byte length EncodeBundle will produce, so the
@@ -93,18 +113,6 @@ func EncodeBundle(dst []byte, m BundleMeta, recs []AscanRecord) []byte {
 	for i := 0; i < 4; i++ {
 		binary.LittleEndian.PutUint32(b[16+4*i:], uint32(m.Encoders[i]))
 	}
-	for i := 0; i < 3; i++ {
-		binary.LittleEndian.PutUint32(b[32+4*i:], math.Float32bits(m.Pose.PosMm[i]))
-	}
-	for i := 0; i < 4; i++ {
-		binary.LittleEndian.PutUint32(b[44+4*i:], math.Float32bits(m.Pose.Quat[i]))
-	}
-	if m.Pose.Valid {
-		b[60] = 1
-	} else {
-		b[60] = 0
-	}
-	b[61], b[62], b[63] = 0, 0, 0
 
 	off := BundleHeaderBytes
 	for i := range recs {

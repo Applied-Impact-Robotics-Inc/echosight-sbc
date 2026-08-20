@@ -176,21 +176,12 @@ func (m Model) View() string {
 	}, "\n")
 
 	// --- measurement panel ---
-	poseTxt := dimStyle.Render("no source")
-	if sn.PoseSource != "" {
-		if sn.PoseValid {
-			poseTxt = lipgloss.NewStyle().Foreground(cOK).Render(fmt.Sprintf("%s  %d ms", sn.PoseSource, sn.PoseAgeMs))
-		} else {
-			poseTxt = lipgloss.NewStyle().Foreground(cErr).Render(sn.PoseSource + "  stale")
-		}
-	}
 	meas := strings.Join([]string{
 		kv("uplink", uplinkLine(sn)),
 		kv("sweep", fmt.Sprintf("%d", sn.LastSweepID)),
 		kv("sequences", fmt.Sprintf("%d", m.sup.SequenceCount())),
 		kv("ws clients", fmt.Sprintf("%d", sn.Clients)),
 		kv("client drops", warnIf(fmt.Sprintf("%d", sn.ClientDrops), sn.ClientDrops > 0)),
-		kv("pose", poseTxt),
 		kv("uptime", dur(time.Since(sn.StartedAt))),
 	}, "\n")
 

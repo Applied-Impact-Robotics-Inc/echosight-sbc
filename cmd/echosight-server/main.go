@@ -28,28 +28,45 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
+
 	"echosight/internal/api"
-	"echosight/internal/config"
+	"echosight/internal/compute"
 	"echosight/internal/device"
-	"echosight/internal/pose"
-	"echosight/internal/presets"
 	"echosight/internal/state"
 	"echosight/internal/tui"
 	"echosight/internal/wire"
 )
 
+// env reads a value with a fallback, for flag defaults.
+//
+// Precedence is flag > environment > built-in default, which is the same
+// ordering fmcwriter and the compute server use. The .env file is for the
+// values that differ between machines; a flag is for a one-off run.
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 func main() {
+	// Load .env before flags so it can supply their defaults. Missing is
+	// normal under systemd, where EnvironmentFile does the same job.
+	if err := godotenv.Load(); err != nil {
+		fmt.Fprintln(os.Stderr, "no .env file, using the environment")
+	}
+
 	var (
-		listen     = flag.String("listen", "0.0.0.0:8975", "HTTP listen address")
-		presetDir  = flag.String("presets", defaultPresetDir(), "directory for saved configurations")
-		captureDir = flag.String("captures", defaultCaptureDir(), "directory for .fmc capture files and last-config.json")
+		listen     = flag.String("listen", env("LISTEN_ADDR", "0.0.0.0:8975"), "HTTP listen address")
+		captureDir = flag.String("captures", env("CAPTURE_DIR", defaultCaptureDir()), "directory for .fmc capture files")
+		computeTo  = flag.String("compute", env("COMPUTE_ADDR", ""), "compute server HTTP address, host:port (COMPUTE_ADDR). This machine pulls its configuration from there on boot and on reconnect; empty means no configuration and the board will not arm")
 		group      = flag.Int("group", 1, "SI5G group index")
 		serial     = flag.Int("serial", 0, "expected board serial; 0 accepts any detected board")
-		poseAddr   = flag.String("pose", "", "UDP address to receive robot pose on, e.g. 127.0.0.1:9100")
 		openTO     = flag.Duration("open-timeout", 20*time.Second, "deadline on the SI5G Open() call")
 		autoResume = flag.Bool("auto-resume", true, "restart firing automatically after a reconnect")
 		headless   = flag.Bool("headless", false, "no TUI; log to stderr (use under systemd)")
-		uplinkTo   = flag.String("uplink", "", "compute server frame receiver, host:port. Empty runs compression and discards output (bench mode)")
+		uplinkTo   = flag.String("uplink", env("UPLINK_ADDR", ""), "compute server frame receiver, host:port (UPLINK_ADDR). Empty runs compression and discards output (bench mode)")
 		logFile    = flag.String("log-file", "", "also append logs to this file")
 		exitOnHang = flag.Bool("exit-on-hang", true, "exit(1) when Open() blows its deadline so a supervisor can restart us")
 	)
@@ -64,57 +81,72 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	ps, err := presets.New(*presetDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "preset directory %s: %v\n", *presetDir, err)
-		os.Exit(1)
-	}
-
-	var poseSrc *pose.Source
-	if *poseAddr != "" {
-		poseSrc, err = pose.NewUDP(*poseAddr)
+	// Pull the configuration for the ACTIVE SESSION from the compute server.
+	//
+	// This replaces last-config.json. That file existed to resume the
+	// operator's working point across a restart, which is the right goal, but
+	// it made this machine a second place a configuration could live and the
+	// two drifted: a stale file holding points 750 and rxCount 30 produced a
+	// diagonal crawl that looked like a live display for a whole session.
+	//
+	// Note this asks for the CURRENT SESSION, not for a default preset. A
+	// reboot mid-scan must restore the geometry the operator chose; pulling a
+	// default would silently revert step 1 to step 2 and everything downstream
+	// would look healthy while being reconstructed against the wrong aperture.
+	//
+	// With no compute server, or no active tank, initialCfg stays nil and the
+	// supervisor refuses to arm. There is deliberately no fallback: a default
+	// this machine could apply on its own is the second source of truth we are
+	// removing.
+	var (
+		initialCfg *wire.Config
+		initialGen string
+		cc         *compute.Client
+	)
+	if *computeTo != "" {
+		cc = compute.New(*computeTo)
+		pullCtx, cancelPull := context.WithTimeout(ctx, 60*time.Second)
+		sess, err := cc.PullWithRetry(pullCtx, 5*time.Second, func(err error) {
+			if errors.Is(err, compute.ErrNoSession) {
+				log.Warn("no active tank on the compute server; waiting", "compute", *computeTo)
+			} else {
+				log.Warn("cannot reach the compute server; retrying", "compute", *computeTo, "err", err)
+			}
+		})
+		cancelPull()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "pose listener %s: %v\n", *poseAddr, err)
-			os.Exit(1)
+			log.Error("no configuration pulled; the board will not arm until one arrives",
+				"compute", *computeTo, "err", err)
+		} else {
+			initialCfg = &sess.Config
+			initialGen = sess.Generation
+			log.Info("pulled configuration", "tank", sess.TankID, "generation", sess.Generation)
 		}
-		go poseSrc.Run(ctx)
-		store.Update(func(sn *state.Snapshot) { sn.PoseSource = *poseAddr })
-		log.Info("pose source listening", "addr", *poseAddr)
+	} else {
+		log.Error("no COMPUTE_ADDR set; this machine has no configuration source and will not arm")
 	}
 
-	// Restore the last applied config so a restart resumes the operator's
-	// working point (HV, gains, geometry) instead of silently reverting to
-	// factory defaults.
-	lastCfgPath := filepath.Join(*captureDir, "last-config.json")
-	var initialCfg *wire.Config
-	if c, err := config.Load(lastCfgPath); err == nil {
-		initialCfg = &c
-		log.Info("restored last applied config", "path", lastCfgPath)
-	} else if ver := (*config.ErrWrongVersion)(nil); errors.As(err, &ver) {
-		// Deliberately NOT migrated. Every pre-v2 file describes a
-		// phased-array scan this server cannot run, and Default() is now the
-		// working FMC point — booting to it beats booting to a translation
-		// nobody has ever run against the board. The old file is kept as
-		// .v1.bak, not deleted.
-		log.Warn("ignoring pre-FMC config; booting to FMC defaults", "err", err)
-	} else if !os.IsNotExist(err) {
-		log.Warn("could not read last config; booting to FMC defaults", "err", err)
-	}
+	// Declared ahead of the supervisor because OnApplied closes over them.
+	var srv *api.Server
+	appliedGen := initialGen
 
 	sup := device.New(device.Options{
 		Store:            store,
 		Broker:           broker,
-		Pose:             poseSrc,
 		Group:            *group,
 		Serial:           *serial,
 		OpenTimeout:      *openTO,
 		AutoResumeFiring: *autoResume,
 		CaptureDir:       *captureDir,
 		UplinkAddr:       *uplinkTo,
-		InitialConfig:    initialCfg,
+		InitialConfig: initialCfg,
+		// Nothing is written to disk. The generation is recorded in memory and
+		// reported in GET /api/state, which is how the compute server notices
+		// this process restarted and pushes again. An applied config that this
+		// machine cannot name is one the compute server cannot verify.
 		OnApplied: func(c wire.Config) {
-			if err := config.Save(lastCfgPath, c); err != nil {
-				log.Warn("could not persist last config", "err", err)
+			if srv != nil {
+				srv.SetConfigGeneration(appliedGen)
 			}
 		},
 		OnHang: func() {
@@ -131,7 +163,8 @@ func main() {
 	})
 	go sup.Run(ctx)
 
-	srv := api.New(sup, store, broker, ps, stop)
+	srv = api.New(sup, store, broker, stop)
+	srv.SetConfigGeneration(appliedGen)
 	httpSrv := &http.Server{
 		Addr:              *listen,
 		Handler:           srv.Handler(),
@@ -176,13 +209,6 @@ func main() {
 	_ = httpSrv.Shutdown(shutdownCtx)
 	sup.Shutdown()
 	log.Info("stopped")
-}
-
-func defaultPresetDir() string {
-	if d, err := os.UserConfigDir(); err == nil {
-		return filepath.Join(d, "echosight", "presets")
-	}
-	return "./presets"
 }
 
 func defaultCaptureDir() string {

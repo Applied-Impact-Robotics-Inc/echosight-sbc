@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"echosight/internal/config"
-	"echosight/internal/pose"
 	"echosight/internal/state"
 	"echosight/internal/wire"
 	"echosight/spike"
@@ -20,7 +19,6 @@ import (
 type Options struct {
 	Store  *state.Store
 	Broker *state.Broker
-	Pose   *pose.Source // nil when no pose source is configured
 
 	Group  int // SI5G group index, 1-based
 	Serial int // expected board serial; 0 accepts whatever is detected
