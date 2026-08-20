@@ -176,7 +176,13 @@ func main() {
 			log.Info("pulled configuration", "tank", sess.TankID, "generation", sess.Generation)
 
 			if res := sup.Stage(sess.Config); !res.Valid {
-				log.Error("configuration from the compute server is invalid", "errors", res.Errors)
+				// Report the path AND the message for each problem. "invalid
+				// configuration" alone leaves the operator diffing two JSON
+				// documents by eye to find which field the board objected to.
+				for _, p := range res.Problems {
+					log.Error("configuration from the compute server is invalid",
+						"field", p.Path, "problem", p.Msg)
+				}
 				return
 			}
 			// The generation is recorded BEFORE the apply, because OnApplied
@@ -303,4 +309,3 @@ func newLogger(store *state.Store, path string) (*slog.Logger, func()) {
 	}
 	return slog.New(storeHandler{inner: inner, store: store}), closer
 }
-
